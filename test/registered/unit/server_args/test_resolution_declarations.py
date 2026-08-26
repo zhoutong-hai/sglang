@@ -434,7 +434,7 @@ class TestResolutionDeclarations(CustomTestCase):
         self.assertGreater(len(mapping), 400, "the namespace mapping collapsed")
 
         # The five sizes keep a live property shadowing the bare name; the
-        # comparison below reaches them anyway, through `get_parallel().config`.
+        # comparison below reaches them through their `configured_` accessor.
         self.assertGreaterEqual(
             _live_topology_leaves()
             & {
@@ -461,14 +461,13 @@ class TestResolutionDeclarations(CustomTestCase):
                     unreachable.append(f"no get_{groups[0]}() for {path}.{field}")
                     continue
                 node = accessor()
-                if groups[0] == "parallel":
-                    # Bare names there are the live topology; the published
-                    # leaves are one hop down, so the reader takes that hop.
-                    node = node.config
+                # A size that also names a live group is published under
+                # `configured_<name>`; the bare name is the group.
+                shadowed = groups[0] == "parallel" and field in _live_topology_leaves()
                 try:
                     for group in groups[1:]:
                         node = getattr(node, group)
-                    leaf = getattr(node, field)
+                    leaf = getattr(node, f"configured_{field}" if shadowed else field)
                 except Exception as exc:
                     unreachable.append(f"{path}.{field}: {type(exc).__name__}: {exc}")
                     continue
