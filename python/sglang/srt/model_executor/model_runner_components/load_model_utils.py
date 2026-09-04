@@ -218,10 +218,14 @@ def load_model_with_memory_saver(
     enable_cpu_backup = server_args.enable_weights_cpu_backup or (
         is_draft_worker and server_args.enable_draft_weights_cpu_backup
     )
+    enable_disk_backup = server_args.enable_weights_disk_backup
+    if enable_cpu_backup and enable_disk_backup:
+        raise ValueError("CPU and disk weight backup are mutually exclusive")
     remote_instance_weight_info = None
     with memory_saver_adapter.region(
         GPU_MEMORY_TYPE_WEIGHTS,
         enable_cpu_backup=enable_cpu_backup,
+        enable_disk_backup=enable_disk_backup,
     ):
         loader = get_model_loader(
             load_config=load_config,

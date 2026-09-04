@@ -1,4 +1,6 @@
 import logging
+import os
+import socket
 from abc import ABC
 from contextlib import contextmanager
 
@@ -12,6 +14,25 @@ except ImportError as e:
     pass
 
 logger = logging.getLogger(__name__)
+
+# Runtime capability marker used by launch preflights that require frozen
+# weights to survive colocated release/resume without consuming host RAM.
+SUPPORTS_DISK_WEIGHT_BACKUP = True
+
+
+def _disk_backup_dir() -> str:
+    root = os.environ.get("SGLANG_TMS_DISK_BACKUP_ROOT")
+    if not root:
+        raise ValueError("SGLANG_TMS_DISK_BACKUP_ROOT is required for disk weight backup")
+    if not os.path.isabs(root):
+        raise ValueError("SGLANG_TMS_DISK_BACKUP_ROOT must be an absolute path")
+    hostname = "".join(
+        character if character.isalnum() or character in "._-" else "_"
+        for character in socket.gethostname()
+    )
+    if not hostname:
+        raise ValueError("Unable to derive a safe hostname for disk weight backup")
+    return os.path.join(root, hostname, str(os.getpid()))
 
 
 class TorchMemorySaverAdapter(ABC):
@@ -38,7 +59,12 @@ class TorchMemorySaverAdapter(ABC):
     def configure_subprocess(self):
         raise NotImplementedError
 
-    def region(self, tag: str, enable_cpu_backup: bool = False):
+    def region(
+        self,
+        tag: str,
+        enable_cpu_backup: bool = False,
+        enable_disk_backup: bool = False,
+    ):
         raise NotImplementedError
 
     def cuda_graph(self, **kwargs):
@@ -64,8 +90,21 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def configure_subprocess(self):
         return torch_memory_saver.configure_subprocess()
 
-    def region(self, tag: str, enable_cpu_backup: bool = False):
-        return _memory_saver.region(tag=tag, enable_cpu_backup=enable_cpu_backup)
+    def region(
+        self,
+        tag: str,
+        enable_cpu_backup: bool = False,
+        enable_disk_backup: bool = False,
+    ):
+        if enable_cpu_backup and enable_disk_backup:
+            raise ValueError("CPU and disk weight backup are mutually exclusive")
+        if enable_disk_backup:
+            _memory_saver.set_disk_backup_dir(_disk_backup_dir())
+        return _memory_saver.region(
+            tag=tag,
+            enable_cpu_backup=enable_cpu_backup,
+            enable_disk_backup=enable_disk_backup,
+        )
 
     def cuda_graph(self, **kwargs):
         return _memory_saver.cuda_graph(**kwargs)
@@ -90,7 +129,12 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
         yield
 
     @contextmanager
-    def region(self, tag: str, enable_cpu_backup: bool = False):
+    def region(
+        self,
+        tag: str,
+        enable_cpu_backup: bool = False,
+        enable_disk_backup: bool = False,
+    ):
         yield
 
     @contextmanager
