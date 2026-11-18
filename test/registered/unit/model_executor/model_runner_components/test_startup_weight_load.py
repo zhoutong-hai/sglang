@@ -26,6 +26,9 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+    dist_barrier_after_load,
+)
 from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
     ModelStorageManifest,
     StartupWeightLoadManager,
@@ -883,6 +886,35 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "resize",
             ],
         )
+
+
+class TestPostLoadRankSkew(CustomTestCase):
+    def test_configured_timeout_allows_a_slow_loading_peer(self):
+        module = "sglang.srt.model_executor.model_runner_components.load_model_utils"
+
+        # A peer still making checkpoint IO progress at 15 minutes must not
+        # fail the old eight-minute barrier when a longer bound was selected.
+        def peer_finishes(**kwargs):
+            if kwargs["timeout"].total_seconds() < 900:
+                raise RuntimeError("peer has not finished loading")
+
+        for configured, should_fail in ((None, True), (1800, False)):
+            with (
+                self.subTest(configured=configured),
+                patch(
+                    module + ".get_parallel",
+                    return_value=SimpleNamespace(
+                        dist_timeout=configured,
+                        tp_group=SimpleNamespace(cpu_group=object()),
+                    ),
+                ),
+                patch(module + ".dist.monitored_barrier", side_effect=peer_finishes),
+            ):
+                if should_fail:
+                    with self.assertRaisesRegex(ValueError, "didn't finish loading"):
+                        dist_barrier_after_load(elastic_ep_backend=None, tp_rank=0)
+                else:
+                    dist_barrier_after_load(elastic_ep_backend=None, tp_rank=0)
 
 
 if __name__ == "__main__":

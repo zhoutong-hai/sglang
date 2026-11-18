@@ -27,7 +27,8 @@ class Parallel(msgspec.Struct):
         "The port for NCCL distributed environment setup. Defaults to a random port.",
     ] = None
     dist_timeout: A[
-        Optional[int], "Set timeout for torch.distributed initialization."
+        Optional[int],
+        "Set timeout in seconds for torch.distributed initialization and the post-load rank barrier.",
     ] = None
     dist_init_addr: A[
         Optional[str],

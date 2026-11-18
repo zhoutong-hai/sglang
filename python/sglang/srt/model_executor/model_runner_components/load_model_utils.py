@@ -98,10 +98,8 @@ def maybe_trigger_remote_instance_nccl_send_group(
     ``--speculative-draft-draft-load-format`` needs its own send group, and the
     target's format cannot answer for it."""
     if (
-        (load_format or get_model().load_format) == LoadFormat.REMOTE_INSTANCE
-        and get_model().remote_instance_weight_loader_backend
-        == RemoteInstanceWeightLoaderBackend.NCCL
-    ):
+        load_format or get_model().load_format
+    ) == LoadFormat.REMOTE_INSTANCE and get_model().remote_instance_weight_loader_backend == RemoteInstanceWeightLoaderBackend.NCCL:
         if tp_rank == 0:
             instance_ip = NetworkAddress.resolve_host(socket.gethostname())
             t = threading.Thread(
@@ -383,10 +381,15 @@ def dist_barrier_after_load(
             dist.barrier(group=get_parallel().tp_group.cpu_group)
     else:
         # Handle the case where some ranks do not finish loading.
+        # A configured distributed timeout also bounds checkpoint-load skew.
+        # Large checkpoints on shared storage can legitimately exceed 480s.
+        timeout_s = get_parallel().dist_timeout
+        if timeout_s is None:
+            timeout_s = UNBALANCED_MODEL_LOADING_TIMEOUT_S
         try:
             dist.monitored_barrier(
                 group=get_parallel().tp_group.cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
+                timeout=datetime.timedelta(seconds=timeout_s),
                 wait_all_ranks=True,
             )
         except RuntimeError:
