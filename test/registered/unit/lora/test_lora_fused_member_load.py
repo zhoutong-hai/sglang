@@ -2,7 +2,8 @@
 projection into its own slot of the fused buffer.
 
 A complete adapter must land byte-identical to the previous concatenate-then-slice loader, and any
-subset of a fused module's projections must load with the absent projections left zero."""
+subset of a fused module's projections must load with the absent projections left zero.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.lora.kimi_k3 import KimiK3LoRAMapping
 from sglang.srt.lora.layers import (
     InklingQKVRLinearWithLoRA,
     MergedColumnParallelLinearWithLoRA,
@@ -138,6 +140,31 @@ def _gate_up(tp_rank, tp_size=2):
     )
 
 
+def _k3_qkvg(tp_rank, tp_size=4):
+    bl = SimpleNamespace(
+        tp_rank=tp_rank,
+        tp_group=_group(tp_rank, tp_size),
+        output_sizes=[16] * 4,
+        output_partition_sizes=[16 // tp_size] * 4,
+    )
+
+    def reference(B):
+        return torch.cat(
+            [
+                rows[tp_rank * (16 // tp_size) : (tp_rank + 1) * (16 // tp_size)]
+                for rows in B.split(16)
+            ]
+        )
+
+    return (
+        "self_attn.fused_qkvg_proj",
+        ("q_proj", "k_proj", "v_proj"),
+        (16, 16, 16),
+        _wrap(MergedColumnParallelLinearWithLoRA, bl),
+        reference,
+    )
+
+
 def _qkvr(tp_rank, tp_size=4):
     bl = SimpleNamespace(
         tp_rank=tp_rank,
@@ -239,9 +266,7 @@ def _member_weights(members, full_rows, present):
     block = _PREFIX + (
         "attn."
         if members[0] == "wq_du"
-        else "mlp."
-        if members[0] == "gate_proj"
-        else "self_attn."
+        else "mlp." if members[0] == "gate_proj" else "self_attn."
     )
     weights = {}
     for m in present:
@@ -268,6 +293,30 @@ def _cases():
     for kind, (factory, tp_size) in _LAYERS.items():
         for tp_rank in range(tp_size):
             yield pytest.param(kind, tp_rank, id=f"{kind}-tp{tp_rank}")
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8, 16])
+def test_k3_qkv_members_use_the_physical_qkvg_group_and_kda_dimensions(tp_size):
+    for tp_rank in range(tp_size):
+        module_path, members, rows, wrapper, reference = _k3_qkvg(tp_rank, tp_size)
+        weights, a, b = _member_weights(members, rows, members)
+        actual_a, actual_b = _load(
+            _pool(module_path, wrapper, rows, _RANK), module_path, wrapper, weights
+        )
+        expected_a, expected_b = _expected(members, rows, a, b, members, reference)
+        assert torch.equal(actual_a, expected_a)
+        assert torch.equal(actual_b, expected_b)
+        assert actual_b.shape[0] == 3 * 16 // tp_size
+    model = KimiK3LoRAMapping()
+    model.config = SimpleNamespace(
+        hidden_size=4,
+        linear_attn_config={"use_full_rank_gate": True, "num_heads": 4, "head_dim": 4},
+    )
+    assert model.get_hidden_dim("fused_qkvg_proj", 0) == (4, 48)
+    assert model.get_lora_target_module_name("self_attn.q_proj") == "fused_qkvg_proj"
+    model.config.linear_attn_config["use_full_rank_gate"] = False
+    with pytest.raises(ValueError, match="full-rank-gate"):
+        model.get_hidden_dim("fused_qkvg_proj", 0)
 
 
 @pytest.mark.parametrize("kind, tp_rank", list(_cases()))

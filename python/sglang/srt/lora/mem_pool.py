@@ -92,11 +92,18 @@ def append_cache_key_suffix(
     return f"{cache_keys}#{suffix}"
 
 
-def _fused_member_slot(weight_name: str) -> Optional[Tuple[str, int]]:
+def _fused_member_slot(
+    weight_name: str, fused_modules: Optional[Iterable[str]] = None
+) -> Optional[Tuple[str, int]]:
     """(fused module, slot) of a dense per-member adapter weight, e.g. ``...self_attn.k_proj.lora_A.weight``."""
     if re.search(r"\.(?:experts|shared_experts?)\.", weight_name):
         return None
     projection = weight_name.split(".lora_", 1)[0].rsplit(".", 1)[-1]
+    if fused_modules is not None:
+        for fused in fused_modules:
+            members = LORA_FUSED_MEMBERS.get(fused, ())
+            if projection in members:
+                return fused, members.index(projection)
     return LORA_FUSED_MEMBER_SLOTS.get(projection)
 
 
@@ -1085,7 +1092,7 @@ class LoRAMemoryPool:
         if lora_adapter.embedding_layers:
             all_weight_names.extend(lora_adapter.embedding_layers.keys())
         for name in all_weight_names:
-            fused_member = _fused_member_slot(name)
+            fused_member = _fused_member_slot(name, self.target_modules)
             if fused_member is not None and fused_member[0] in self.target_modules:
                 matched_modules.add(fused_member[0])
                 continue
@@ -1157,7 +1164,7 @@ class LoRAMemoryPool:
                         f".experts.{fused_moe._num_global_routed}.",
                         name,
                     )
-                fused_member = _fused_member_slot(name)
+                fused_member = _fused_member_slot(name, fused_member_modules)
                 if fused_member is not None and fused_member[0] in fused_member_modules:
                     # PEFT may ship an untrained member as a zero-element placeholder.
                     if weights.numel() == 0:

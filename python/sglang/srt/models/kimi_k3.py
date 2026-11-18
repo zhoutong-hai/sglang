@@ -99,6 +99,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
+from sglang.srt.lora.kimi_k3 import KimiK3LoRAMapping
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
@@ -3030,7 +3031,7 @@ class KimiK3LinearModel(nn.Module):
         )
 
 
-class KimiK3LinearForCausalLM(nn.Module):
+class KimiK3LinearForCausalLM(KimiK3LoRAMapping, nn.Module):
     """Text-only K3 causal LM."""
 
     # ModelSlim describes quantization with the original checkpoint module
@@ -3506,7 +3507,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         self._kda_prefill_precompiled = True
 
 
-class KimiK3ForConditionalGeneration(nn.Module):
+class KimiK3ForConditionalGeneration(KimiK3LoRAMapping, nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
     supports_cuda_vmm_feature_transport = True
@@ -3547,15 +3548,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
             "block_sparse_moe": "mlp",
         },
     )
-
-    @staticmethod
-    def get_lora_target_module_name(name: str) -> str:
-        parent, _, leaf = name.rpartition(".")
-        if ".experts" in parent:
-            return {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}.get(
-                leaf, name
-            )
-        return name
 
     def __init__(
         self,

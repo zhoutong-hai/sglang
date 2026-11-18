@@ -291,6 +291,9 @@ def get_default_hidden_dim(
 # Fused LoRA modules loaded member by member: each adapter projection fills its own slot of
 # the fused buffer, sliced by the wrapper of the fused layer; untrained members stay zero.
 LORA_FUSED_MEMBERS = {
+    # K3 shares the HF Q/K/V names with qkv_proj; the physical layer selects its group.
+    # Keep qkv_proj later so the unscoped reverse lookup retains its ordinary mapping.
+    "fused_qkvg_proj": ("q_proj", "k_proj", "v_proj"),
     "qkv_proj": ("q_proj", "k_proj", "v_proj"),
     "gate_up_proj": ("gate_proj", "up_proj"),
     "fused_qkv_a_proj_with_mqa": ("q_a_proj", "kv_a_proj_with_mqa"),
@@ -444,6 +447,7 @@ REPLICATED_LINEAR_LORA_NAMES = [
 # qwen3_5.py take tp_size/tp_rank from attn_tp when dp attention is enabled).
 ATTN_TP_LORA_MODULE_NAMES = frozenset(
     {
+        "fused_qkvg_proj",
         "qkv_proj",
         "qkvr",
         "q_b_proj",
@@ -466,6 +470,7 @@ ATTN_TP_LORA_MODULE_NAMES = frozenset(
 # (i.e. get_hidden_dim, init_buffers, and init_lora_modules can handle them).
 _KNOWN_LORA_TARGET_MODULES = frozenset(
     {
+        "fused_qkvg_proj",
         "qkv_proj",
         "qkvr",
         "o_proj",
