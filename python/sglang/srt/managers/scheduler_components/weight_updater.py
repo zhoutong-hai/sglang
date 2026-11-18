@@ -50,7 +50,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     LocalSerializedTensor,
 )
-from sglang.srt.runtime_context import get_lora, get_model, get_parallel
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.weight_checker import overall_checksum
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
@@ -133,11 +133,9 @@ class SchedulerWeightUpdaterManager:
     _lora_stash: Dict[str, Dict[str, torch.Tensor]] = field(default_factory=dict)
     _lora_applied_names: Dict[str, frozenset] = field(default_factory=dict)
     tp_cpu_group: Any = field(init=False)
-    _lora_stash_device: Optional[str] = field(init=False)
 
     def __post_init__(self) -> None:
         self.tp_cpu_group = get_parallel().tp_group.cpu_group
-        self._lora_stash_device = None if get_lora().lora_no_cpu_backup else "cpu"
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -479,12 +477,11 @@ class SchedulerWeightUpdaterManager:
             ), f"streamed LoRA tensor {prefixed_name!r} must arrive as a plain tensor"
             if copy_tensors:
                 # the stash outlives this RPC, but an IPC sender may reuse the bucket once it replies
-                # Honor the adapter manager's storage policy while receiving,
-                # before the complete adapter accumulates. A blocking CPU copy
-                # also finishes the IPC read before the sender reuses its bucket.
-                tensor = tensor.to(
-                    device=self._lora_stash_device or tensor.device, copy=True
-                )
+                # Transport staging is temporary and separate from the adapter
+                # manager's post-install backup policy. Never accumulate a full
+                # rank128 MoE adapter on GPU. The blocking CPU copy finishes the
+                # IPC read before the sender reuses its bucket.
+                tensor = tensor.to(device="cpu", copy=True)
                 if tensor.is_cuda:
                     copied_devices.add(tensor.device)
             self._lora_stash.setdefault(lora_name, {})[hf_key] = tensor

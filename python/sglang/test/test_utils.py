@@ -243,7 +243,7 @@ if is_in_ci():
     )
 else:
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
+        20000 + int((os.environ.get("CUDA_VISIBLE_DEVICES") or "0")[0]) * 1000
     )
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 

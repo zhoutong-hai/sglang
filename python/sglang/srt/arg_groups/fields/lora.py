@@ -107,7 +107,7 @@ class Lora(msgspec.Struct):
     ] = False
     lora_no_cpu_backup: A[
         bool,
-        "Keep streamed LoRA weights on the GPU and drop the staged copy once the adapter is installed in the memory pool, instead of holding a host copy per TP rank. Evicting an adapter from the pool is then refused, so every loaded adapter needs its own slot.",
+        "Drop the staged copy once the adapter is installed in the GPU memory pool, instead of holding a host copy per TP rank. IPC transport may temporarily stage on CPU. Evicting an adapter from the pool is then refused, so every loaded adapter needs its own slot.",
     ] = False
     lora_drain_wait_threshold: A[
         float,

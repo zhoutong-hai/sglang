@@ -24,7 +24,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     LocalSerializedTensor,
 )
-from sglang.srt.runtime_context import get_lora, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import MultiprocessingSerializer
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -75,12 +75,6 @@ class TestSplitLoraNamedTensors(CustomTestCase):
 
 
 class TestLoraStash(CustomTestCase):
-    def test_stream_staging_uses_the_configured_adapter_storage_policy(self):
-        for no_cpu_backup, expected in ((False, "cpu"), (True, None)):
-            with get_lora().override(lora_no_cpu_backup=no_cpu_backup):
-                manager = _make_manager()
-            self.assertEqual(manager._lora_stash_device, expected)
-
     def test_stash_groups_by_adapter(self):
         mgr = _make_manager()
         a, b = torch.zeros(2), torch.ones(2)

@@ -302,7 +302,6 @@ class TestStashCopiesIPCBuckets(unittest.TestCase):
         manager = SchedulerWeightUpdaterManager.__new__(SchedulerWeightUpdaterManager)
         manager.tp_worker = SimpleNamespace(ps=SimpleNamespace(tp_rank=0))
         manager._lora_stash = {}
-        manager._lora_stash_device = "cpu"
         bucket = torch.ones(4)
         manager._stash_lora_tensors([("A@2:q_proj", bucket)], copy_tensors=True)
         bucket.zero_()
