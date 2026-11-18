@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 import traceback
 from contextlib import contextmanager
@@ -55,6 +56,11 @@ from sglang.srt.utils.weight_checker import overall_checksum
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 logger = logging.getLogger(__name__)
+
+_PACKED_EXPERT_FACTOR = re.compile(
+    r"\.experts\.(w1|w3|w2|gate_proj|up_proj|down_proj)\.lora_(A|B)\."
+)
+_LAYER_ID = re.compile(r"\.layers\.(\d+)\.")
 
 
 def _split_lora_named_tensors(named_tensors):
@@ -131,6 +137,10 @@ class SchedulerWeightUpdaterManager:
     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
     _session: Optional[_WeightUpdateSession] = None
     _lora_stash: Dict[str, Dict[str, torch.Tensor]] = field(default_factory=dict)
+    # Full-wire and retained-slice checksums: sharding must not weaken the sender manifest.
+    _lora_stash_checksums: Dict[str, Dict[str, Tuple[str, str]]] = field(
+        default_factory=dict
+    )
     _lora_applied_names: Dict[str, frozenset] = field(default_factory=dict)
     tp_cpu_group: Any = field(init=False)
 
@@ -426,6 +436,7 @@ class SchedulerWeightUpdaterManager:
                 "call end_weight_update() first",
             )
         self._lora_stash = {}
+        self._lora_stash_checksums = {}
         if recv_req.sync_base:
             for _, runner in self._select_runners(recv_req.selector):
                 runner.weight_updater.begin_weight_update()
@@ -451,6 +462,7 @@ class SchedulerWeightUpdaterManager:
                 runner.weight_updater.end_weight_update(run_post_load=run_post_load)
         if recv_req.abort:
             self._lora_stash = {}
+            self._lora_stash_checksums = {}
             success, message = True, "Aborted: streamed adapters discarded"
         else:
             success, message = self._apply_lora_stash(recv_req.expected_lora_checksums)
@@ -466,8 +478,48 @@ class SchedulerWeightUpdaterManager:
         is a new adapter identity and may stream a different tensor set."""
         self._lora_applied_names.pop(lora_name, None)
 
+    def _tp_shard_packed_expert_factor(
+        self, hf_key: str, tensor: torch.Tensor
+    ) -> torch.Tensor:
+        """Use the loader's TP slice before retaining a packed factor (adapted from upstream #44617)."""
+        factor, layer = _PACKED_EXPERT_FACTOR.search(hf_key), _LAYER_ID.search(hf_key)
+        if (
+            factor is None
+            or layer is None
+            or tensor.dim() != 3
+            or tensor.shape[0] <= 1
+            or "shared_expert" in hf_key
+        ):
+            return tensor
+        manager = getattr(self.tp_worker.model_runner, "lora_manager", None)
+        if manager is None or int(layer.group(1)) >= len(manager.lora_modules):
+            return tensor
+        for module in manager.lora_modules[int(layer.group(1))].values():
+            if not hasattr(module, "slice_moe_lora_b_weights") or getattr(
+                module.base_layer, "is_shared_fused_moe", False
+            ):
+                continue
+            if module.tp_size <= 1:
+                return tensor
+            proj, side = factor.groups()
+            shard = module.intermediate_size_per_partition
+            start = module.tp_rank * shard
+            if (
+                side == "B"
+                and proj in ("w1", "w3", "gate_proj", "up_proj")
+                and tensor.shape[1] == shard * module.tp_size
+            ):
+                return tensor[:, start : start + shard, :]
+            if (
+                side == "A"
+                and proj in ("w2", "down_proj")
+                and tensor.shape[2] == shard * module.tp_size
+            ):
+                return tensor[:, :, start : start + shard]
+            return tensor
+        return tensor
+
     def _stash_lora_tensors(self, lora_tensors, *, copy_tensors: bool = False) -> None:
-        copied_devices = set()
         for prefixed_name, tensor in lora_tensors:
             lora_name, hf_key = prefixed_name.split(":", 1)
             if isinstance(tensor, LocalSerializedTensor):
@@ -477,16 +529,18 @@ class SchedulerWeightUpdaterManager:
             ), f"streamed LoRA tensor {prefixed_name!r} must arrive as a plain tensor"
             if copy_tensors:
                 # the stash outlives this RPC, but an IPC sender may reuse the bucket once it replies
-                # Transport staging is temporary and separate from the adapter
-                # manager's post-install backup policy. Never accumulate a full
-                # rank128 MoE adapter on GPU. The blocking CPU copy finishes the
-                # IPC read before the sender reuses its bucket.
-                tensor = tensor.to(device="cpu", copy=True)
-                if tensor.is_cuda:
-                    copied_devices.add(tensor.device)
+                # Finish the IPC read before the sender reuses its bucket. Hash
+                # the original wire tensor, then retain an owned TP-local slice.
+                cpu_tensor = tensor.cpu()
+                wire_checksum = _sha256_tensor(cpu_tensor)
+                tensor = self._tp_shard_packed_expert_factor(hf_key, cpu_tensor).to(
+                    device="cpu", copy=True
+                )
+                self._lora_stash_checksums.setdefault(lora_name, {})[hf_key] = (
+                    wire_checksum,
+                    _sha256_tensor(tensor),
+                )
             self._lora_stash.setdefault(lora_name, {})[hf_key] = tensor
-        for device in copied_devices:
-            torch.cuda.current_stream(device).synchronize()
 
     def _apply_lora_stash(
         self, expected_checksums: Optional[Dict[str, Dict[str, str]]]
@@ -517,7 +571,11 @@ class SchedulerWeightUpdaterManager:
                         f"do not match the expected manifest"
                     )
                 for name in sorted(tensors):
-                    if _sha256_tensor(tensors[name]) != expected[name]:
+                    actual = _sha256_tensor(tensors[name])
+                    wire, retained = self._lora_stash_checksums.get(lora_name, {}).get(
+                        name, (actual, actual)
+                    )
+                    if wire != expected[name] or actual != retained:
                         return False, (
                             f"[LORA-CHECK] adapter {lora_name!r}: checksum mismatch for {name!r}"
                         )
@@ -532,6 +590,7 @@ class SchedulerWeightUpdaterManager:
                 return False, result.error_message
             self._lora_applied_names[lora_name] = names
         self._lora_stash = {}
+        self._lora_stash_checksums = {}
         return True, "Success"
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):

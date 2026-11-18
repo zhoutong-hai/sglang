@@ -135,9 +135,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         if hasattr(base_layer, "tp_size") and base_layer.tp_size > 1:
             from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
-            assert not get_attn_tp_context().allow_input_scattered, (
-                "VocabParallelEmbeddingWithLoRA with TP > 1 under input_scattered mode (e.g., DeepSeek-v2 MLA with --enable-attn-tp-input-scattered) is not fully supported and may produce incorrect results. Consider disabling input_scattered or removing embed_tokens from LoRA target modules."
-            )
+            assert (
+                not get_attn_tp_context().allow_input_scattered
+            ), "VocabParallelEmbeddingWithLoRA with TP > 1 under input_scattered mode (e.g., DeepSeek-v2 MLA with --enable-attn-tp-input-scattered) is not fully supported and may produce incorrect results. Consider disabling input_scattered or removing embed_tokens from LoRA target modules."
         offsets = [0, self.embed_dim]
         self.lora_offsets = tuple(offsets)
         self.output_offset = torch.tensor(
@@ -1183,9 +1183,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # on Triton. Inkling shared experts use InklingBatchDenseMLP directly
         # and never reach this wrapper.
         if runner_backend.is_marlin():
-            from sglang.srt.layers.quantization.unquant import (
-                UnquantizedFusedMoEMethod,
-            )
+            from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
             if isinstance(base_layer.quant_method, UnquantizedFusedMoEMethod):
                 runner_backend = MoeRunnerBackend.TRITON
@@ -1444,6 +1442,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self, A: torch.Tensor, tp_rank: int, target_module: str
     ) -> torch.Tensor:
         shard_size = self.intermediate_size_per_partition
+        if A.shape[-1] == shard_size:
+            return A.contiguous()  # the IPC receiver already kept this rank's slice
         start = tp_rank * shard_size
         end = start + shard_size
         return A[..., start:end].contiguous()
@@ -1494,7 +1494,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             # B has shape [intermediate_size, rank] — TP-shard directly.
             is_gated = self.base_layer.moe_runner_config.is_gated
             if not is_gated:
-                if self.tp_size > 1:
+                if (
+                    self.tp_size > 1
+                    and B.shape[0] != self.intermediate_size_per_partition
+                ):
                     shard_size = self.intermediate_size_per_partition
                     start = tp_rank * shard_size
                     end = start + shard_size
@@ -1505,6 +1508,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             start = tp_rank * shard_size
             end = start + shard_size
             full_inter = B.shape[0] // 2
+            if full_inter == shard_size:
+                start, end = 0, shard_size  # already this rank's [gate | up] slice
             gate_b = B[start:end, :]
             up_b = B[full_inter + start : full_inter + end, :]
             if self._uses_interleaved_gate_up:

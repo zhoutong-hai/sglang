@@ -2,7 +2,7 @@
 whole-adapter apply at end_weight_update."""
 
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import torch
@@ -12,6 +12,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.lora.layers import FusedMoEWithLoRA
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
@@ -75,6 +76,74 @@ class TestSplitLoraNamedTensors(CustomTestCase):
 
 
 class TestLoraStash(CustomTestCase):
+    def test_tp_local_stash_preserves_full_wire_manifest_and_detects_slice_corruption(
+        self,
+    ):
+        for corrupt in (False, True):
+            mgr = _make_manager()
+            module = SimpleNamespace(
+                tp_size=4,
+                tp_rank=2,
+                intermediate_size_per_partition=4,
+                base_layer=SimpleNamespace(is_shared_fused_moe=False),
+                slice_moe_lora_b_weights=None,
+            )
+            loras = mgr.tp_worker.model_runner.lora_manager
+            loras.lora_modules = [{"moe": module}]
+            loras.apply_streamed_adapter.return_value = SimpleNamespace(success=True)
+            key = "language_model.model.layers.0.block_sparse_moe.experts.w1.lora_B.weight"
+            wire = torch.arange(2 * 16 * 3).reshape(2, 16, 3).float()
+            manifest = {"miles_lora": {key: _sha256_tensor(wire)}}
+            mgr._stash_lora_tensors([("miles_lora:" + key, wire)], copy_tensors=True)
+            retained = mgr._lora_stash["miles_lora"][key]
+            self.assertTrue(torch.equal(retained, wire[:, 8:12]))
+            self.assertEqual(
+                retained.untyped_storage().nbytes(),
+                retained.numel() * retained.element_size(),
+            )
+            wire.zero_()
+            if corrupt:
+                retained.add_(1)
+            success, message = mgr._apply_lora_stash(manifest)
+            self.assertEqual(success, not corrupt, message)
+            if corrupt:
+                loras.apply_streamed_adapter.assert_not_called()
+
+    def test_pre_sliced_expert_factors_match_original_full_factor_loading(self):
+        for tp_size in (2, 4, 16):
+            for rank in range(tp_size):
+                module = SimpleNamespace(
+                    tp_size=tp_size,
+                    intermediate_size_per_partition=4,
+                    base_layer=SimpleNamespace(
+                        moe_runner_config=SimpleNamespace(is_gated=True)
+                    ),
+                    _uses_interleaved_gate_up=False,
+                )
+                for name in ("_slice_moe_a", "_slice_moe_b_2d"):
+                    setattr(
+                        module,
+                        name,
+                        MethodType(getattr(FusedMoEWithLoRA, name), module),
+                    )
+                inter = 4 * tp_size
+                a = torch.arange(3 * inter).reshape(3, inter)
+                b = torch.arange(2 * inter * 3).reshape(2 * inter, 3)
+                rows = slice(rank * 4, (rank + 1) * 4)
+                local_b = torch.cat((b[:inter][rows], b[inter:][rows]))
+                self.assertTrue(
+                    torch.equal(
+                        module._slice_moe_a(a, rank, "down_proj_moe"),
+                        module._slice_moe_a(a[:, rows], rank, "down_proj_moe"),
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        module._slice_moe_b_2d(b, rank, "gate_up_proj_moe"),
+                        module._slice_moe_b_2d(local_b, rank, "gate_up_proj_moe"),
+                    )
+                )
+
     def test_stash_groups_by_adapter(self):
         mgr = _make_manager()
         a, b = torch.zeros(2), torch.ones(2)
