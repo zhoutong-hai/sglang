@@ -50,7 +50,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     LocalSerializedTensor,
 )
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_lora, get_model, get_parallel
 from sglang.srt.utils.weight_checker import overall_checksum
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
@@ -68,9 +68,9 @@ def _split_lora_named_tensors(named_tensors):
         if ":" in name:
             lora_tensors.append((name, tensor))
         else:
-            assert ".lora_A." not in name and ".lora_B." not in name, (
-                f"LoRA tensor {name!r} arrived without a '{{lora_name}}:' prefix"
-            )
+            assert (
+                ".lora_A." not in name and ".lora_B." not in name
+            ), f"LoRA tensor {name!r} arrived without a '{{lora_name}}:' prefix"
             base_tensors.append((name, tensor))
     return base_tensors, lora_tensors
 
@@ -133,9 +133,11 @@ class SchedulerWeightUpdaterManager:
     _lora_stash: Dict[str, Dict[str, torch.Tensor]] = field(default_factory=dict)
     _lora_applied_names: Dict[str, frozenset] = field(default_factory=dict)
     tp_cpu_group: Any = field(init=False)
+    _lora_stash_device: Optional[str] = field(init=False)
 
     def __post_init__(self) -> None:
         self.tp_cpu_group = get_parallel().tp_group.cpu_group
+        self._lora_stash_device = None if get_lora().lora_no_cpu_backup else "cpu"
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -287,9 +289,9 @@ class SchedulerWeightUpdaterManager:
                 )
                 base_tensors, lora_tensors = _split_lora_named_tensors(weights)
                 if base_tensors:
-                    assert self._session.sync_base, (
-                        "base tensors arrived in a sync_base=False weight-update session"
-                    )
+                    assert (
+                        self._session.sync_base
+                    ), "base tensors arrived in a sync_base=False weight-update session"
                 self._stash_lora_tensors(lora_tensors)
             except Exception as e:
                 success, message = False, f"Failed to receive weights: {e}"
@@ -348,9 +350,9 @@ class SchedulerWeightUpdaterManager:
             self._stash_lora_tensors(lora_tensors, copy_tensors=True)
             success, message = True, "Success"
             if base_tensors:
-                assert self._session.sync_base, (
-                    "base tensors arrived in a sync_base=False weight-update session"
-                )
+                assert (
+                    self._session.sync_base
+                ), "base tensors arrived in a sync_base=False weight-update session"
                 for _, runner in self._select_runners(recv_req.selector):
                     success, message = runner.weight_updater.update_weights_from_tensor(
                         named_tensors=named_tensors,
@@ -472,12 +474,17 @@ class SchedulerWeightUpdaterManager:
             lora_name, hf_key = prefixed_name.split(":", 1)
             if isinstance(tensor, LocalSerializedTensor):
                 tensor = tensor.get(get_parallel().tp_rank)
-            assert isinstance(tensor, torch.Tensor), (
-                f"streamed LoRA tensor {prefixed_name!r} must arrive as a plain tensor"
-            )
+            assert isinstance(
+                tensor, torch.Tensor
+            ), f"streamed LoRA tensor {prefixed_name!r} must arrive as a plain tensor"
             if copy_tensors:
                 # the stash outlives this RPC, but an IPC sender may reuse the bucket once it replies
-                tensor = tensor.clone()
+                # Honor the adapter manager's storage policy while receiving,
+                # before the complete adapter accumulates. A blocking CPU copy
+                # also finishes the IPC read before the sender reuses its bucket.
+                tensor = tensor.to(
+                    device=self._lora_stash_device or tensor.device, copy=True
+                )
                 if tensor.is_cuda:
                     copied_devices.add(tensor.device)
             self._lora_stash.setdefault(lora_name, {})[hf_key] = tensor
@@ -664,9 +671,9 @@ class SchedulerWeightUpdaterManager:
 
         if self.draft_worker is not None:
             draft_url = params.get("draft_url", None)
-            assert draft_url is not None, (
-                "draft_url must be provided when draft model is enabled"
-            )
+            assert (
+                draft_url is not None
+            ), "draft_url must be provided when draft model is enabled"
             self.draft_worker.model_runner.weight_exporter.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):
