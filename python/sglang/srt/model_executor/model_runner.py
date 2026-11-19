@@ -480,7 +480,12 @@ class ModelRunner:
         # CPU offload
         set_offloader(create_offloader())
 
-        self._weight_checker = WeightChecker(get_model=lambda: self.model)
+        self._weight_checker = WeightChecker(
+            get_model=lambda: self.model,
+            get_lora_checksums=lambda names: self.lora_manager.installed_adapter_checksums(
+                names
+            ),
+        )
 
         if envs.SGLANG_DETECT_SLOW_RANK.get():
             slow_rank_detector.execute()

@@ -3,7 +3,7 @@ whole-adapter apply at end_weight_update."""
 
 import unittest
 from types import MethodType, SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
@@ -15,12 +15,13 @@ maybe_stub_sgl_kernel()
 from sglang.srt.lora.layers import FusedMoEWithLoRA
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.managers.io_struct import LoRAUpdateOutput
+from sglang.srt.managers.io_struct import EndWeightUpdateReqInput, LoRAUpdateOutput
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
     _sha256_tensor,
     _split_lora_named_tensors,
     _WeightUpdateSession,
+    _tensor_metadata,
 )
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     LocalSerializedTensor,
@@ -76,6 +77,72 @@ class TestSplitLoraNamedTensors(CustomTestCase):
 
 
 class TestLoraStash(CustomTestCase):
+    def test_structural_copy_is_owned_tp_local_and_never_hashed(self):
+        mgr = _make_manager()
+        mgr._session = _WeightUpdateSession(
+            selector="all", sync_base=False, verify_lora_checksums=False
+        )
+        module = SimpleNamespace(
+            tp_size=4,
+            tp_rank=2,
+            intermediate_size_per_partition=4,
+            base_layer=SimpleNamespace(is_shared_fused_moe=False),
+            slice_moe_lora_b_weights=None,
+        )
+        loras = mgr.tp_worker.model_runner.lora_manager
+        loras.lora_modules = [{"moe": module}]
+        loras.apply_streamed_adapter.return_value = SimpleNamespace(success=True)
+        key = "language_model.model.layers.0.block_sparse_moe.experts.w1.lora_B.weight"
+        wire = torch.arange(2 * 16 * 3).reshape(2, 16, 3).float()
+        expected = wire[:, 8:12].clone()
+        manifest = {"miles_lora": {key: _tensor_metadata(wire)}}
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater._sha256_tensor",
+            side_effect=AssertionError("structural publication must not hash bytes"),
+        ):
+            mgr._stash_lora_tensors([("miles_lora:" + key, wire)], copy_tensors=True)
+            owned = mgr._lora_stash["miles_lora"][key]
+            self.assertEqual(
+                owned.untyped_storage().nbytes(), owned.numel() * owned.element_size()
+            )
+            wire.zero_()
+            self.assertTrue(torch.equal(owned, expected))
+            self.assertTrue(mgr._apply_lora_stash(None, manifest)[0])
+        loras.apply_streamed_adapter.assert_called_once()
+
+    def test_structural_manifest_fails_closed_before_install(self):
+        for defect in ("missing", "extra", "shape", "dtype", "adapter", "none"):
+            with self.subTest(defect=defect):
+                mgr = _make_manager()
+                mgr._session = _WeightUpdateSession(
+                    selector="all", verify_lora_checksums=False
+                )
+                mgr._stash_lora_tensors(
+                    [(f"a:{LORA_A}", torch.ones(2, 3))], copy_tensors=True
+                )
+                manifest = {"a": {LORA_A: {"shape": [2, 3], "dtype": "torch.float32"}}}
+                if defect == "missing":
+                    manifest["a"].clear()
+                elif defect == "extra":
+                    manifest["a"][LORA_B] = manifest["a"][LORA_A]
+                elif defect in ("shape", "dtype"):
+                    manifest["a"][LORA_A][defect] = (
+                        [3, 2] if defect == "shape" else "torch.bfloat16"
+                    )
+                elif defect == "adapter":
+                    manifest["other"] = manifest.pop("a")
+                else:
+                    manifest = None
+                self.assertFalse(mgr._apply_lora_stash(None, manifest)[0])
+                mgr.tp_worker.model_runner.lora_manager.apply_streamed_adapter.assert_not_called()
+
+    def test_duplicate_factor_is_rejected(self):
+        mgr = _make_manager()
+        bucket = [(f"a:{LORA_A}", torch.ones(2))]
+        mgr._stash_lora_tensors(bucket, copy_tensors=True)
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            mgr._stash_lora_tensors(bucket, copy_tensors=True)
+
     def test_tp_local_stash_preserves_full_wire_manifest_and_detects_slice_corruption(
         self,
     ):
@@ -285,6 +352,42 @@ class TestApplyLoraStash(CustomTestCase):
 
 
 class TestLoRAManagerStreamEntryPoints(CustomTestCase):
+    def test_installed_audit_uses_resolved_live_slot_and_rejects_invalid_ownership(
+        self,
+    ):
+        manager = self._bare_manager()
+        ref = LoRARef(lora_name="miles_lora", lora_path="__stream__")
+        manager.lora_refs[ref.lora_id] = ref
+        values = dict(
+            A_buffer={"q": [torch.arange(12).reshape(2, 2, 3).float()]},
+            B_buffer={},
+            embedding_A_buffer={},
+            embedding_B_buffer={},
+            lm_head_A_buffer={},
+            lm_head_B_buffer={},
+            new_embeddings_buffer={},
+        )
+        pool = SimpleNamespace(
+            invalid_uids=set(),
+            uid_to_buffer_id={ref.lora_id: 1},
+            buffer_id_to_uid=[None, ref.lora_id],
+            **values,
+        )
+        manager.memory_pool = pool
+        before = manager.installed_adapter_checksums(["miles_lora"])
+        self.assertEqual(len(before), 1)
+        pool.A_buffer["q"][0][0].add_(5)
+        self.assertEqual(manager.installed_adapter_checksums(["miles_lora"]), before)
+        pool.A_buffer["q"][0][1].add_(5)
+        self.assertNotEqual(manager.installed_adapter_checksums(["miles_lora"]), before)
+        pool.invalid_uids.add(ref.lora_id)
+        with self.assertRaisesRegex(ValueError, "invalid or nonresident"):
+            manager.installed_adapter_checksums(["miles_lora"])
+        pool.invalid_uids.clear()
+        pool.buffer_id_to_uid[1] = "foreign"
+        with self.assertRaisesRegex(ValueError, "slot ownership"):
+            manager.installed_adapter_checksums(["miles_lora"])
+
     def _bare_manager(self):
         manager = object.__new__(LoRAManager)
         manager.lora_refs = {}
@@ -346,6 +449,25 @@ class TestWeightVersionDeferredToCommit(CustomTestCase):
         mgr = _make_manager(scheduler=Mock())
         mgr._session = _WeightUpdateSession(selector="all")
         return mgr
+
+    def test_structural_failure_and_abort_do_not_commit_version(self):
+        for abort in (False, True):
+            mgr = _make_manager(scheduler=Mock())
+            mgr._session = _WeightUpdateSession(
+                selector="target",
+                sync_base=False,
+                verify_lora_checksums=False,
+                pending_version="7",
+            )
+            mgr._stash_lora_tensors([(f"a:{LORA_A}", torch.ones(2))], copy_tensors=True)
+            with patch("torch.distributed.barrier"):
+                result = mgr.end_weight_update(EndWeightUpdateReqInput(abort=abort))
+            self.assertEqual(result.success, abort)
+            mgr.scheduler.record_weight_version_change.assert_not_called()
+            mgr.tp_worker.model_runner.lora_manager.apply_streamed_adapter.assert_not_called()
+            if abort:
+                self.assertEqual(mgr._lora_stash, {})
+                self.assertEqual(mgr._lora_stash_metadata, {})
 
     def test_bucket_version_is_held_while_the_session_is_open(self):
         mgr = self._manager()

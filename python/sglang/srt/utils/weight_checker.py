@@ -108,8 +108,14 @@ class _ArenaAllocator:
 
 
 class WeightChecker:
-    def __init__(self, *, get_model: Callable[[], Any]):
+    def __init__(
+        self,
+        *,
+        get_model: Callable[[], Any],
+        get_lora_checksums: Optional[Callable] = None,
+    ):
         self._get_model = get_model
+        self._get_lora_checksums = get_lora_checksums
         # Capture the runner placement before its draft scope exits.
         parallel = get_parallel()
         self._placement = dict(
@@ -148,6 +154,17 @@ class WeightChecker:
             return self._compute_checksum(skip_tensor_list, role=role)
         elif action == "raw_checksum":
             return self._compute_raw_checksum(names, role=role)
+        elif action == "lora_checksum":
+            if self._get_lora_checksums is None or not names:
+                raise ValueError(
+                    "installed LoRA audit requires enabled LoRA and explicit names"
+                )
+            checksums = self._get_lora_checksums(names)
+            return ChecksumInfo(
+                checksums=checksums,
+                per_gpu_checksum=overall_checksum(checksums),
+                parallelism_info=self._parallelism_info(role=role),
+            ).model_dump()
         else:
             raise Exception(f"Unsupported {action=}")
 

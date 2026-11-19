@@ -303,6 +303,8 @@ class TestStashCopiesIPCBuckets(unittest.TestCase):
         manager.tp_worker = SimpleNamespace(ps=SimpleNamespace(tp_rank=0))
         manager._lora_stash = {}
         manager._lora_stash_checksums = {}
+        manager._lora_stash_metadata = {}
+        manager._session = None
         bucket = torch.ones(4)
         manager._stash_lora_tensors([("A@2:q_proj", bucket)], copy_tensors=True)
         bucket.zero_()

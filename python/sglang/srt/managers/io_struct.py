@@ -2286,6 +2286,8 @@ class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
     # sync), so the quant unpack/repack round-trip is skipped and a base-named
     # tensor arriving in-session is an error.
     sync_base: bool = True
+    # False skips tensor-byte hashing; end must supply a complete structural manifest.
+    verify_lora_checksums: bool = True
 
 
 class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
@@ -2301,6 +2303,8 @@ class EndWeightUpdateReqInput(BaseReq, kw_only=True):
     # {lora_name: {hf_key: sha256}}; when set, each stashed adapter is verified
     # (set equality + per-tensor checksum) before it is applied.
     expected_lora_checksums: Optional[Dict[str, Dict[str, str]]] = None
+    # {lora_name: {hf_key: {shape: [...], dtype: "torch.bfloat16"}}}
+    expected_lora_metadata: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
     # discard the streamed LoRA stash and deferred publications; in-place base writes are not rolled back
     abort: bool = False
 

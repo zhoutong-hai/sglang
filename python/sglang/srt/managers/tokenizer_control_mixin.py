@@ -528,7 +528,11 @@ class TokenizerControlMixin:
         missing = (
             set()
             if obj.abort
-            else set(pending) - set(obj.expected_lora_checksums or {})
+            else set(pending)
+            - (
+                set(obj.expected_lora_checksums or {})
+                | set(obj.expected_lora_metadata or {})
+            )
         )
         obj.abort = obj.abort or bool(missing)
         success, message = await self._weight_update_session_call(
@@ -548,7 +552,7 @@ class TokenizerControlMixin:
         if missing:
             return (
                 False,
-                f"deferred adapters {sorted(missing)} have no checksum manifest; session aborted",
+                f"deferred adapters {sorted(missing)} have no complete manifest; session aborted",
             )
         return success, message
 

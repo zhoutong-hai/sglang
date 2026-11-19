@@ -15,6 +15,7 @@
 # Integrates "S-LoRA: Serving Thousands of Concurrent LoRA Adapters"
 # and "Punica: Multi-Tenant LoRA Serving"
 
+import hashlib
 import logging
 import re
 from typing import Dict, Iterable, List, Optional, Sequence
@@ -1065,6 +1066,55 @@ class LoRAManager:
             f"streamed weights for unregistered LoRA adapter {lora_name!r}; "
             "call /register_lora_adapter before streaming its tensors"
         )
+
+    def installed_adapter_checksums(self, names: List[str]) -> Dict[str, str]:
+        """Explicit qualification audit of live serving slots, never the receive stash.
+
+        Ordinary publication does not call this expensive byte reader.
+        """
+        if not names:
+            raise ValueError("installed LoRA audit requires explicit adapter names")
+        pool = self.memory_pool
+        checksums = {}
+        for name in names:
+            uid = self.require_registered(name).lora_id
+            if uid in pool.invalid_uids or uid not in pool.uid_to_buffer_id:
+                raise ValueError(f"adapter {name!r} is invalid or nonresident")
+            slot = pool.uid_to_buffer_id[uid]
+            if (
+                not 0 <= slot < len(pool.buffer_id_to_uid)
+                or pool.buffer_id_to_uid[slot] != uid
+            ):
+                raise ValueError(f"adapter {name!r} has inconsistent slot ownership")
+            count = 0
+            for category in (
+                "A_buffer",
+                "B_buffer",
+                "embedding_A_buffer",
+                "embedding_B_buffer",
+                "lm_head_A_buffer",
+                "lm_head_B_buffer",
+                "new_embeddings_buffer",
+            ):
+                for key, buffers in sorted(getattr(pool, category).items()):
+                    if not isinstance(buffers, (list, tuple)):
+                        buffers = [buffers]
+                    for index, buffer in enumerate(buffers):
+                        value = (
+                            buffer[slot]
+                            .detach()
+                            .to(device="cpu", copy=True)
+                            .contiguous()
+                        )
+                        identity = f"{name}/{category}/{key}/{index}/{tuple(value.shape)}/{value.dtype}"
+                        wire = value.reshape(-1).view(torch.uint8).numpy()
+                        checksums[identity] = hashlib.sha256(
+                            memoryview(wire)
+                        ).hexdigest()
+                        count += 1
+            if not count:
+                raise ValueError(f"adapter {name!r} has no installed buffers")
+        return checksums
 
     def apply_streamed_adapter(
         self, lora_name: str, tensors: Dict[str, torch.Tensor]
